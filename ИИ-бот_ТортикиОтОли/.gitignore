@@ -5,6 +5,8 @@
 *.pem
 *.key
 credentials.json
+credentials/*.json
+!credentials/.gitkeep
 secrets/
 
 # Python

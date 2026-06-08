@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 
-from bot.constants import MENU_CATEGORIES, PHONE_DISPLAY
-from config.settings import Settings
+from bot.constants import MENU_CATEGORIES
+
+CONSENT_AGREE = "pd_consent:agree"
+CONSENT_DECLINE = "pd_consent:decline"
+CONSENT_PRIVACY = "pd_consent:privacy"
 
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -15,19 +18,22 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
-def phone_keyboard(settings: Settings) -> InlineKeyboardMarkup:
-    tel = settings.phone_tel_uri
+def cancel_lead_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup([["❌ Отменить заявку"]], resize_keyboard=True)
+
+
+def pd_consent_inline_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    text=f"📞 Позвонить: {PHONE_DISPLAY}",
-                    url=f"tel:{tel}",
+                    "📄 Политика конфиденциальности",
+                    callback_data=CONSENT_PRIVACY,
                 )
+            ],
+            [
+                InlineKeyboardButton("✅ Согласен", callback_data=CONSENT_AGREE),
+                InlineKeyboardButton("❌ Не согласен", callback_data=CONSENT_DECLINE),
             ],
         ]
     )
-
-
-def cancel_lead_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([["❌ Отменить заявку"]], resize_keyboard=True)

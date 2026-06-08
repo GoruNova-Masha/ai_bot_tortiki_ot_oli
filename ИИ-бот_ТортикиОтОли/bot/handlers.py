@@ -6,8 +6,10 @@ from typing import TYPE_CHECKING
 
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import NetworkError, TelegramError, TimedOut
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
@@ -16,13 +18,37 @@ from telegram.ext import (
 )
 
 from bot.ai_client import AIAssistant
-from bot.constants import MENU_CATEGORIES, PHONE_DISPLAY
+from bot.constants import MENU_CATEGORIES
 from bot.geography import out_of_area_message, resolve_city
-from bot.keyboards import cancel_lead_keyboard, main_menu_keyboard, phone_keyboard
-from bot.lead import Lead, client_handoff_text, contact_date_label
+from bot.google_sheets import GoogleSheetsLeadWriter
+from bot.keyboards import (
+    CONSENT_AGREE,
+    CONSENT_DECLINE,
+    CONSENT_PRIVACY,
+    cancel_lead_keyboard,
+    main_menu_keyboard,
+    pd_consent_inline_keyboard,
+)
+from bot.media import (
+    PHOTO_BRIEF_PROMPT,
+    PHOTO_REFERENCE_PROMPT,
+    get_image_data_url,
+    get_image_url,
+)
+from bot.lead import (
+    Lead,
+    client_handoff_text,
+    consent_datetime_label,
+    contact_date_label,
+    format_phone_display,
+    normalize_phone,
+    pd_consent_message,
+)
+from bot.privacy_policy import POLICY_BUTTON_LABEL, format_privacy_policy_html
+from bot.network import retry_on_network
 from bot.prompts import build_system_prompt
 from bot.security import RateLimiter, is_user_allowed, sanitize_for_log, validate_message_length
-from bot.storage import BusyDatesStore, ChatMemory
+from bot.storage import BusyDatesStore, ChatMemory, PdConsentStore
 from config.settings import Settings
 
 if TYPE_CHECKING:
@@ -31,7 +57,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Состояния оформления заявки
-LEAD_NAME, LEAD_CITY, LEAD_PRODUCT, LEAD_BRIEF = range(4)
+LEAD_CONSENT, LEAD_NAME, LEAD_PHONE, LEAD_CITY, LEAD_PRODUCT, LEAD_BRIEF = range(6)
 
 CATEGORY_HINTS: dict[str, str] = {
     "cakes": (
@@ -66,14 +92,18 @@ CATEGORY_HINTS: dict[str, str] = {
 
 MENU_LABEL_TO_KEY = {label: key for key, label in MENU_CATEGORIES}
 
+PHOTO_FILTER = filters.PHOTO | filters.Document.IMAGE
+
 
 class BotContext:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.memory = ChatMemory()
         self.busy_dates = BusyDatesStore()
+        self.pd_consents = PdConsentStore()
         self.rate_limiter = RateLimiter(settings.rate_limit_per_minute)
         self.ai = AIAssistant(settings, build_system_prompt(settings))
+        self.sheets = GoogleSheetsLeadWriter(settings)
         self._admin_ids = settings.admin_user_id_set
 
 
@@ -126,16 +156,115 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return await cmd_start(update, context)
 
 
+async def _send_privacy_policy(update: Update, settings: Settings) -> None:
+    await update.message.reply_text(
+        format_privacy_policy_html(settings),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+async def cmd_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = get_ctx().settings
+    if not await _guard(update, settings):
+        return
+    await _send_privacy_policy(update, settings)
+
+
 async def cmd_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     settings = get_ctx().settings
     if not await _guard(update, settings):
         return ConversationHandler.END
     context.user_data["in_lead"] = True
     await update.message.reply_text(
-        "Оформим заявку для Оли 📋\nКак тебя зовут?",
+        "Оформим заявку для Оли 📋",
+        reply_markup=cancel_lead_keyboard(),
+    )
+    await update.message.reply_text(
+        pd_consent_message(settings),
+        parse_mode=ParseMode.HTML,
+        reply_markup=pd_consent_inline_keyboard(),
+    )
+    return LEAD_CONSENT
+
+
+def _is_consent_agree(text: str) -> bool:
+    normalized = text.strip().lower().lstrip("✅").strip()
+    return normalized in ("согласен", "согласна", "да", "ok", "ок", "yes", "+")
+
+
+def _is_consent_decline(text: str) -> bool:
+    normalized = text.strip().lower().lstrip("❌").strip()
+    return normalized in ("не согласен", "не согласна", "нет", "no")
+
+
+async def _grant_consent(message, context: ContextTypes.DEFAULT_TYPE) -> int:
+    settings = get_ctx().settings
+    consent_at = consent_datetime_label(settings)
+    context.user_data["pd_consent_at"] = consent_at
+    try:
+        get_ctx().pd_consents.record_consent(
+            user_id=message.chat_id,
+            consent_at=consent_at,
+        )
+    except OSError:
+        logger.exception("Не удалось сохранить согласие на ПД")
+
+    await message.reply_text(
+        "Спасибо! Как тебя зовут?",
         reply_markup=cancel_lead_keyboard(),
     )
     return LEAD_NAME
+
+
+async def _decline_consent(message, context: ContextTypes.DEFAULT_TYPE) -> int:
+    _clear_lead(context)
+    await message.reply_text(
+        "Без согласия на обработку персональных данных оформление заказа "
+        "невозможно. Если передумаете — нажмите «Оформить заявку» в меню.",
+        reply_markup=main_menu_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+async def lead_consent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query:
+        return LEAD_CONSENT
+    await query.answer()
+
+    if query.data == CONSENT_PRIVACY:
+        await query.message.reply_text(
+            format_privacy_policy_html(get_ctx().settings),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        return LEAD_CONSENT
+    if query.data == CONSENT_DECLINE:
+        return await _decline_consent(query.message, context)
+    if query.data == CONSENT_AGREE:
+        return await _grant_consent(query.message, context)
+    return LEAD_CONSENT
+
+
+async def lead_consent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip()
+    if text == "❌ Отменить заявку":
+        return await _cancel_lead(update, context)
+    if text == POLICY_BUTTON_LABEL:
+        await _send_privacy_policy(update, get_ctx().settings)
+        return LEAD_CONSENT
+    if _is_consent_decline(text) or text == "❌ Не согласен":
+        return await _decline_consent(update.message, context)
+    if _is_consent_agree(text) or text == "✅ Согласен":
+        return await _grant_consent(update.message, context)
+
+    await update.message.reply_text(
+        "Нажми кнопку «✅ Согласен» или «❌ Не согласен» под сообщением выше. "
+        "Можно также написать «согласен» или «не согласен».",
+        reply_markup=pd_consent_inline_keyboard(),
+    )
+    return LEAD_CONSENT
 
 
 async def lead_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -146,6 +275,24 @@ async def lead_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("Напиши, пожалуйста, имя — хотя бы 2 символа.")
         return LEAD_NAME
     context.user_data["lead_name"] = text[:100]
+    await update.message.reply_text(
+        "Укажи номер телефона для связи (например, +7 930 123-45-67)."
+    )
+    return LEAD_PHONE
+
+
+async def lead_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip()
+    if text == "❌ Отменить заявку":
+        return await _cancel_lead(update, context)
+    phone = normalize_phone(text)
+    if not phone:
+        await update.message.reply_text(
+            "Не получилось распознать номер. Напиши телефон в формате "
+            "+7XXXXXXXXXX или 8XXXXXXXXXX."
+        )
+        return LEAD_PHONE
+    context.user_data["lead_phone"] = format_phone_display(phone)
     await update.message.reply_text(
         "Из какого ты города? (Балахна, Заволжье или Нижний Новгород)"
     )
@@ -186,56 +333,209 @@ async def lead_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 async def lead_brief(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    settings = get_ctx().settings
     text = (update.message.text or "").strip()
     if text == "❌ Отменить заявку":
         return await _cancel_lead(update, context)
+    return await _finish_lead_brief(update, context, text)
+
+
+async def lead_brief_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    settings = get_ctx().settings
+    image_data_url = await get_image_data_url(update, settings)
+    if not image_data_url:
+        await update.message.reply_text(
+            "Не удалось загрузить фото. Попробуй отправить ещё раз "
+            "или опиши пожелания текстом."
+        )
+        return LEAD_BRIEF
+
+    caption = (update.message.caption or "").strip()
+    try:
+        await update.message.chat.send_action("typing")
+    except (TimedOut, NetworkError, TelegramError):
+        pass
+
+    analysis = await get_ctx().ai.describe_image_for_brief(
+        PHOTO_BRIEF_PROMPT,
+        image_data_url,
+    )
+    if not analysis:
+        if len(caption) >= 5:
+            text = (
+                f"{caption}\n\n"
+                "📷 К заявке приложено фото-референс "
+                "(автоописание временно недоступно)."
+            )
+            return await _finish_lead_brief(update, context, text[:1500])
+        await update.message.reply_text(
+            "Не получилось разобрать фото автоматически 😔\n"
+            "Добавь, пожалуйста, текстом: дата, вес, вкусы и пожелания по декору. "
+            "Можешь отправить фото ещё раз вместе с подписью."
+        )
+        return LEAD_BRIEF
+
+    if caption:
+        text = f"{caption}\n\nРеференс по фото: {analysis}"
+    else:
+        text = f"Референс по фото: {analysis}"
+    return await _finish_lead_brief(update, context, text[:1500])
+
+
+async def _finish_lead_brief(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+) -> int:
+    settings = get_ctx().settings
     if len(text) < 5:
         await update.message.reply_text("Добавь чуть больше деталей в ТЗ (минимум 5 символов).")
         return LEAD_BRIEF
 
     user = update.effective_user
+    if not user:
+        await update.message.reply_text("Не удалось определить пользователя. Нажми /start.")
+        return ConversationHandler.END
+
+    missing = [
+        label
+        for key, label in (
+            ("lead_name", "имя"),
+            ("lead_phone", "телефон"),
+            ("lead_city", "город"),
+            ("lead_product", "заказ"),
+        )
+        if not context.user_data.get(key)
+    ]
+    if missing:
+        logger.warning(
+            "Неполная заявка user_id=%s, нет полей: %s",
+            user.id,
+            ", ".join(missing),
+        )
+        _clear_lead(context)
+        await update.message.reply_text(
+            "Данные заявки потерялись (часто из‑за второго запущенного бота). "
+            "Оформи заявку заново: /order",
+            reply_markup=main_menu_keyboard(),
+        )
+        return ConversationHandler.END
+
     lead = Lead(
         name=context.user_data["lead_name"],
+        phone=context.user_data["lead_phone"],
         city=context.user_data["lead_city"],
         city_in_service_area=context.user_data.get("lead_city_ok", False),
         product=context.user_data["lead_product"],
         brief=text[:1500],
         user_id=user.id,
         contact_date=contact_date_label(settings),
+        pd_consent_at=context.user_data.get("pd_consent_at", "—"),
     )
+
+    try:
+        get_ctx().pd_consents.update_latest(
+            user.id,
+            name=lead.name,
+            phone=lead.phone,
+        )
+    except OSError:
+        logger.exception("Не удалось обновить журнал согласий на ПД")
 
     await _submit_lead(update, settings, lead)
     _clear_lead(context)
     return ConversationHandler.END
 
 
-async def _submit_lead(update: Update, settings: Settings, lead: Lead) -> None:
-    manager_id = settings.telegram_manager_chat_id.strip()
-    if manager_id:
+async def _send_ai_reply(update: Update, user_id: int, user_note: str, reply: str) -> None:
+    ctx = get_ctx()
+    ctx.memory.append(user_id, "user", user_note)
+    ctx.memory.append(user_id, "assistant", reply)
+    try:
+        await retry_on_network(
+            lambda: update.message.reply_text(reply),
+            action_name="отправке ответа пользователю",
+        )
+    except TelegramError:
+        logger.exception("Не удалось отправить ответ пользователю")
         try:
-            await update.get_bot().send_message(
-                chat_id=int(manager_id),
-                text=lead.format_for_manager(),
-                parse_mode=ParseMode.HTML,
+            await update.message.reply_text(
+                "Ответ готов, но Telegram временно не отвечает. "
+                "Попробуй написать ещё раз через минуту."
             )
-        except Exception:
-            logger.exception("Не удалось отправить заявку менеджеру chat_id=%s", manager_id)
+        except TelegramError:
+            pass
 
-    await update.message.reply_text(
-        client_handoff_text(settings),
-        parse_mode=ParseMode.HTML,
-        reply_markup=main_menu_keyboard(),
-    )
-    await update.message.reply_text(
-        f"Или нажми кнопку ниже, чтобы позвонить: {PHONE_DISPLAY}",
-        reply_markup=phone_keyboard(settings),
-    )
+
+async def _submit_lead(update: Update, settings: Settings, lead: Lead) -> None:
+    try:
+        submit_result = await get_ctx().sheets.submit_lead(lead)
+        if submit_result.saved_to_sheets:
+            logger.info("Заявка №%s записана в Google Таблицу", submit_result.lead_id)
+        elif submit_result.buffered:
+            logger.warning(
+                "Заявка №%s в буфере Google Sheets — повтор через %s мин",
+                submit_result.lead_id,
+                settings.google_sheets_retry_minutes,
+            )
+        else:
+            logger.warning(
+                "Заявка №%s оформлена без Google Sheets (интеграция отключена)",
+                submit_result.lead_id,
+            )
+    except Exception:
+        logger.exception("Критическая ошибка записи заявки №? в Google Sheets")
+        from bot.google_sheets import LeadSubmitResult
+
+        submit_result = LeadSubmitResult(
+            lead_id=0,
+            delivery_date="",
+            saved_to_sheets=False,
+            buffered=False,
+        )
+
+    try:
+        await retry_on_network(
+            lambda: update.message.reply_text(
+                client_handoff_text(
+                    settings,
+                    lead_id=submit_result.lead_id,
+                    delivery_date=submit_result.delivery_date,
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu_keyboard(),
+            ),
+            action_name="подтверждении заявки",
+        )
+    except TelegramError:
+        logger.exception("Не удалось отправить подтверждение заявки пользователю")
+
+    manager_id = settings.telegram_manager_chat_id.strip()
+    if not manager_id:
+        return
+    try:
+        manager_note = lead.format_for_manager(submit_result.lead_id)
+        if submit_result.buffered:
+            manager_note += (
+                "\n\n⚠️ <i>Запись в Google Таблицу отложена — "
+                "бот повторит через несколько минут.</i>"
+            )
+        await update.get_bot().send_message(
+            chat_id=int(manager_id),
+            text=manager_note,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        logger.exception("Не удалось отправить заявку менеджеру chat_id=%s", manager_id)
 
 
 def _clear_lead(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("in_lead", None)
-    for key in ("lead_name", "lead_city", "lead_city_ok", "lead_product"):
+    for key in (
+        "lead_name",
+        "lead_phone",
+        "lead_city",
+        "lead_city_ok",
+        "lead_product",
+        "pd_consent_at",
+    ):
         context.user_data.pop(key, None)
 
 
@@ -294,11 +594,56 @@ async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         sanitize_for_log(text),
     )
 
-    await update.message.chat.send_action("typing")
-    ctx.memory.append(user.id, "user", text)
+    try:
+        await update.message.chat.send_action("typing")
+    except (TimedOut, NetworkError, TelegramError) as exc:
+        logger.warning("Не удалось отправить typing: %s", exc)
+
     reply = await ctx.ai.reply(ctx.memory.get(user.id), text)
-    ctx.memory.append(user.id, "assistant", reply)
-    await update.message.reply_text(reply)
+    await _send_ai_reply(update, user.id, text, reply)
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = get_ctx().settings
+    if not await _guard(update, settings):
+        return
+
+    if context.user_data.get("in_lead"):
+        return
+
+    user = update.effective_user
+    if not user:
+        return
+
+    image_data_url = await get_image_data_url(update, settings)
+    if not image_data_url:
+        image_data_url = await get_image_url(update, settings)
+    if not image_data_url:
+        await update.message.reply_text(
+            "Не удалось загрузить фото. Попробуй отправить ещё раз или опиши идею текстом."
+        )
+        return
+
+    caption = (update.message.caption or "").strip()
+    prompt = PHOTO_REFERENCE_PROMPT
+    if caption:
+        prompt = f"{PHOTO_REFERENCE_PROMPT}\n\nКомментарий клиента: {caption}"
+
+    logger.info("Фото user_id=%s caption=%s", user.id, sanitize_for_log(caption or "—"))
+
+    try:
+        await update.message.chat.send_action("typing")
+    except (TimedOut, NetworkError, TelegramError) as exc:
+        logger.warning("Не удалось отправить typing: %s", exc)
+
+    ctx = get_ctx()
+    history = ctx.memory.get(user.id)
+    reply = await ctx.ai.reply_with_image(history, prompt, image_data_url)
+
+    memory_note = "📷 Фото референс"
+    if caption:
+        memory_note = f"{memory_note}: {caption}"
+    await _send_ai_reply(update, user.id, memory_note, reply)
 
 
 # --- Админ: занятые даты (не показываются клиентам) ---
@@ -369,10 +714,18 @@ def register_handlers(app: Application, settings: Settings) -> None:
             ),
         ],
         states={
+            LEAD_CONSENT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, lead_consent),
+                CallbackQueryHandler(lead_consent_callback, pattern=r"^pd_consent:"),
+            ],
             LEAD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, lead_name)],
+            LEAD_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, lead_phone)],
             LEAD_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, lead_city)],
             LEAD_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, lead_product)],
-            LEAD_BRIEF: [MessageHandler(filters.TEXT & ~filters.COMMAND, lead_brief)],
+            LEAD_BRIEF: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, lead_brief),
+                MessageHandler(PHOTO_FILTER, lead_brief_photo),
+            ],
         },
         fallbacks=[
             CommandHandler("cancel", _cancel_lead),
@@ -386,9 +739,11 @@ def register_handlers(app: Application, settings: Settings) -> None:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("privacy", cmd_privacy))
     app.add_handler(lead_conv)
     app.add_handler(MessageHandler(menu_filter, handle_menu_button))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("adddate", cmd_adddate))
     app.add_handler(CommandHandler("deldate", cmd_deldate))
+    app.add_handler(MessageHandler(PHOTO_FILTER, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_free_text))

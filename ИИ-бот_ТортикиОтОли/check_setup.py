@@ -17,6 +17,10 @@ def main() -> int:
         print("TELEGRAM_MANAGER_CHAT_ID:", s.telegram_manager_chat_id or "(не задан)")
         print("BUSINESS_PHONE:", s.business_phone)
         print("Модель ИИ:", s.openai_model)
+        if s.google_sheets_enabled:
+            print("Google Sheets: OK,", s.google_sheets_spreadsheet_id or s.google_sheets_spreadsheet_name)
+        else:
+            print("Google Sheets: ВЫКЛ (нет ключа или ID таблицы)")
     except Exception as e:
         print("Ошибка настроек:", e)
         return 1

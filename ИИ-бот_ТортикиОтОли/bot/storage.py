@@ -9,6 +9,7 @@ from typing import Any
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _BUSY_DATES_PATH = _PROJECT_ROOT / "data" / "busy_dates.json"
+_PD_CONSENTS_PATH = _PROJECT_ROOT / "data" / "pd_consents.json"
 _MAX_HISTORY = 12
 
 
@@ -78,3 +79,55 @@ class BusyDatesStore:
 
 def today_iso() -> str:
     return datetime.now().date().isoformat()
+
+
+class PdConsentStore:
+    """Журнал согласий на обработку персональных данных."""
+
+    def __init__(self, path: Path = _PD_CONSENTS_PATH) -> None:
+        self._path = path
+        _ensure_data_dir()
+        if not self._path.exists():
+            self._write([])
+
+    def _read(self) -> list[dict[str, Any]]:
+        try:
+            data: list[Any] = json.loads(self._path.read_text(encoding="utf-8"))
+            return [dict(item) for item in data if isinstance(item, dict)]
+        except (json.JSONDecodeError, OSError):
+            return []
+
+    def _write(self, records: list[dict[str, Any]]) -> None:
+        _ensure_data_dir()
+        self._path.write_text(
+            json.dumps(records, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def record_consent(
+        self,
+        *,
+        user_id: int,
+        consent_at: str,
+        name: str = "",
+        phone: str = "",
+    ) -> None:
+        records = self._read()
+        records.append(
+            {
+                "user_id": user_id,
+                "consent_at": consent_at,
+                "name": name,
+                "phone": phone,
+            }
+        )
+        self._write(records)
+
+    def update_latest(self, user_id: int, *, name: str, phone: str) -> None:
+        records = self._read()
+        for item in reversed(records):
+            if item.get("user_id") == user_id:
+                item["name"] = name
+                item["phone"] = phone
+                self._write(records)
+                return
