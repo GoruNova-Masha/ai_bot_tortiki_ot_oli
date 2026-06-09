@@ -18,8 +18,21 @@ from telegram.ext import (
 )
 
 from bot.ai_client import AIAssistant
-from bot.constants import MENU_CATEGORIES
-from bot.geography import out_of_area_message, resolve_city
+from bot.constants import (
+    DELIVERY_CITIES_TEXT,
+    MENU_CATEGORIES,
+    PICKUP_CITY,
+    RECEIPT_DELIVERY,
+    RECEIPT_PICKUP,
+    RECEIPT_PICKUP_LABEL,
+)
+from bot.geography import (
+    out_of_area_message,
+    pickup_available,
+    receipt_options,
+    receipt_options_hint,
+    resolve_city,
+)
 from bot.google_sheets import GoogleSheetsLeadWriter
 from bot.keyboards import (
     CONSENT_AGREE,
@@ -28,6 +41,7 @@ from bot.keyboards import (
     cancel_lead_keyboard,
     main_menu_keyboard,
     pd_consent_inline_keyboard,
+    receipt_method_keyboard,
 )
 from bot.media import (
     PHOTO_BRIEF_PROMPT,
@@ -57,7 +71,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Состояния оформления заявки
-LEAD_CONSENT, LEAD_NAME, LEAD_PHONE, LEAD_CITY, LEAD_PRODUCT, LEAD_BRIEF = range(6)
+(
+    LEAD_CONSENT,
+    LEAD_NAME,
+    LEAD_PHONE,
+    LEAD_CITY,
+    LEAD_RECEIPT,
+    LEAD_ADDRESS,
+    LEAD_PRODUCT,
+    LEAD_BRIEF,
+) = range(8)
 
 CATEGORY_HINTS: dict[str, str] = {
     "cakes": (
@@ -299,6 +322,23 @@ async def lead_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return LEAD_CITY
 
 
+async def _start_delivery_address(message, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["lead_receipt"] = RECEIPT_DELIVERY
+    await message.reply_text(
+        "Укажи адрес доставки: улица, дом, подъезд, этаж.",
+        reply_markup=cancel_lead_keyboard(),
+    )
+    return LEAD_ADDRESS
+
+
+async def _start_pickup_order(message, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["lead_receipt"] = RECEIPT_PICKUP
+    context.user_data["lead_delivery_address"] = ""
+    if not pickup_available(context.user_data.get("lead_city", "")):
+        await message.reply_text(f"Самовывоз — в {PICKUP_CITY}.")
+    return await _ask_lead_product(message, context)
+
+
 async def lead_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = (update.message.text or "").strip()
     if text == "❌ Отменить заявку":
@@ -308,14 +348,95 @@ async def lead_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["lead_city"] = city
     context.user_data["lead_city_ok"] = in_area
 
+    can_pickup, can_deliver = receipt_options(city, in_area)
+    context.user_data["lead_pickup_ok"] = can_pickup
+    context.user_data["lead_delivery_ok"] = can_deliver
+
     if not in_area:
         await update.message.reply_text(out_of_area_message(city))
+    else:
+        await update.message.reply_text(receipt_options_hint(city, in_area))
 
-    await update.message.reply_text(
-        "Что тебя интересует?\n"
-        "Например: торт на день рождения, бенто, набор клубники, сладкий стол."
+    if can_pickup and can_deliver:
+        await update.message.reply_text(
+            "Как удобнее получить заказ?",
+            reply_markup=receipt_method_keyboard(pickup=True, delivery=True),
+        )
+        return LEAD_RECEIPT
+
+    if can_deliver:
+        return await _start_delivery_address(update.message, context)
+
+    return await _start_pickup_order(update.message, context)
+
+
+def _is_receipt_pickup(text: str) -> bool:
+    normalized = text.strip().lower().replace("🏠", "").strip()
+    return normalized == RECEIPT_PICKUP_LABEL.lower()
+
+
+def _is_receipt_delivery(text: str) -> bool:
+    normalized = text.strip().lower().replace("🚗", "").strip()
+    return normalized == RECEIPT_DELIVERY_LABEL.lower()
+
+
+async def _ask_lead_product(message, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await message.reply_text(
+        "Какой тип заказа?\n"
+        "Например: торт на день рождения, бенто-торт, набор клубники, сладкий стол.\n"
+        "Если уже обсуждали детали в чате — просто укажи тип, "
+        "а пожелания опишешь на следующем шаге.",
+        reply_markup=cancel_lead_keyboard(),
     )
     return LEAD_PRODUCT
+
+
+async def lead_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip()
+    if text == "❌ Отменить заявку":
+        return await _cancel_lead(update, context)
+
+    can_pickup = context.user_data.get("lead_pickup_ok", False)
+    can_deliver = context.user_data.get("lead_delivery_ok", False)
+    keyboard = receipt_method_keyboard(pickup=can_pickup, delivery=can_deliver)
+
+    if _is_receipt_pickup(text):
+        if not can_pickup:
+            await update.message.reply_text(
+                f"Самовывоз возможен только в {PICKUP_CITY}.",
+                reply_markup=keyboard,
+            )
+            return LEAD_RECEIPT
+        return await _start_pickup_order(update.message, context)
+
+    if _is_receipt_delivery(text):
+        if not can_deliver:
+            await update.message.reply_text(
+                f"Доставка возможна только в {DELIVERY_CITIES_TEXT}. "
+                f"Выбери самовывоз в {PICKUP_CITY} или укажи другой город.",
+                reply_markup=keyboard,
+            )
+            return LEAD_RECEIPT
+        return await _start_delivery_address(update.message, context)
+
+    await update.message.reply_text(
+        "Выбери способ получения кнопкой ниже.",
+        reply_markup=keyboard,
+    )
+    return LEAD_RECEIPT
+
+
+async def lead_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip()
+    if text == "❌ Отменить заявку":
+        return await _cancel_lead(update, context)
+    if len(text) < 5:
+        await update.message.reply_text(
+            "Адрес слишком короткий. Укажи улицу, дом и при необходимости подъезд и этаж."
+        )
+        return LEAD_ADDRESS
+    context.user_data["lead_delivery_address"] = text[:300]
+    return await _ask_lead_product(update.message, context)
 
 
 async def lead_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -326,9 +447,19 @@ async def lead_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await update.message.reply_text("Опиши коротко, что хочешь заказать.")
         return LEAD_PRODUCT
     context.user_data["lead_product"] = text[:300]
-    await update.message.reply_text(
-        "Кратко опиши пожелания: дата праздника, вес/количество, вкусы, декор, аллергии."
-    )
+    if context.user_data.get("lead_receipt") == RECEIPT_DELIVERY:
+        brief_prompt = (
+            "Опиши пожелания к заказу: дата доставки, время (если важно), "
+            "вес или размер, вкусы, декор, надпись, аллергии.\n"
+            "Сюда же можно добавить всё, о чём уже договорились в чате."
+        )
+    else:
+        brief_prompt = (
+            "Опиши пожелания к заказу: дата самовывоза, вес или размер, "
+            "вкусы, декор, надпись, аллергии.\n"
+            "Сюда же можно добавить всё, о чём уже договорились в чате."
+        )
+    await update.message.reply_text(brief_prompt)
     return LEAD_BRIEF
 
 
@@ -400,10 +531,16 @@ async def _finish_lead_brief(
             ("lead_name", "имя"),
             ("lead_phone", "телефон"),
             ("lead_city", "город"),
+            ("lead_receipt", "способ получения"),
             ("lead_product", "заказ"),
         )
         if not context.user_data.get(key)
     ]
+    if (
+        context.user_data.get("lead_receipt") == RECEIPT_DELIVERY
+        and not context.user_data.get("lead_delivery_address")
+    ):
+        missing.append("адрес доставки")
     if missing:
         logger.warning(
             "Неполная заявка user_id=%s, нет полей: %s",
@@ -428,6 +565,8 @@ async def _finish_lead_brief(
         user_id=user.id,
         contact_date=contact_date_label(settings),
         pd_consent_at=context.user_data.get("pd_consent_at", "—"),
+        receipt_method=context.user_data.get("lead_receipt", RECEIPT_PICKUP),
+        delivery_address=context.user_data.get("lead_delivery_address", ""),
     )
 
     try:
@@ -487,6 +626,7 @@ async def _submit_lead(update: Update, settings: Settings, lead: Lead) -> None:
         submit_result = LeadSubmitResult(
             lead_id=0,
             delivery_date="",
+            receipt_method=lead.receipt_method,
             saved_to_sheets=False,
             buffered=False,
         )
@@ -498,6 +638,7 @@ async def _submit_lead(update: Update, settings: Settings, lead: Lead) -> None:
                     settings,
                     lead_id=submit_result.lead_id,
                     delivery_date=submit_result.delivery_date,
+                    receipt_method=submit_result.receipt_method,
                 ),
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_menu_keyboard(),
@@ -533,6 +674,10 @@ def _clear_lead(context: ContextTypes.DEFAULT_TYPE) -> None:
         "lead_phone",
         "lead_city",
         "lead_city_ok",
+        "lead_pickup_ok",
+        "lead_delivery_ok",
+        "lead_receipt",
+        "lead_delivery_address",
         "lead_product",
         "pd_consent_at",
     ):
@@ -721,6 +866,8 @@ def register_handlers(app: Application, settings: Settings) -> None:
             LEAD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, lead_name)],
             LEAD_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, lead_phone)],
             LEAD_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, lead_city)],
+            LEAD_RECEIPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, lead_receipt)],
+            LEAD_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, lead_address)],
             LEAD_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, lead_product)],
             LEAD_BRIEF: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, lead_brief),

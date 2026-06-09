@@ -97,7 +97,7 @@ def main() -> int:
     from google.oauth2.service_account import Credentials
     import gspread
 
-    from bot.google_sheets import SCOPES, SHEET_HEADERS
+    from bot.google_sheets import SCOPES, SHEET_HEADERS, SHEET_HEADER_RANGE
     from config.settings import get_settings
 
     get_settings.cache_clear()
@@ -129,12 +129,12 @@ def main() -> int:
     try:
         worksheet = spreadsheet.worksheet(worksheet_name)
     except gspread.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=1000, cols=11)
+        worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=1000, cols=len(SHEET_HEADERS))
         print(f"Создан лист: {worksheet_name}")
 
     first_row = worksheet.row_values(1)
     if not any(cell.strip() for cell in first_row):
-        worksheet.update(values=[list(SHEET_HEADERS)], range_name="A1:K1")
+        worksheet.update(values=[list(SHEET_HEADERS)], range_name=SHEET_HEADER_RANGE)
         print("Добавлена шапка столбцов.")
     elif [cell.strip() for cell in first_row if cell.strip()] != list(SHEET_HEADERS):
         print("[!] Первая строка уже заполнена и отличается от шаблона — шапку не меняли.")

@@ -24,6 +24,29 @@ _ADDRESS_HINT_RE = re.compile(
     r"(?:адрес|доставк(?:а|и|у|ой))\s*[:\-—]?\s*([^\n.;]{5,200})",
     re.IGNORECASE,
 )
+_PRODUCT_KEYWORDS_RE = re.compile(
+    r"\b(?:"
+    r"бенто(?:[\-\s]?торт)?|"
+    r"торт(?:\s+на\s+\w+)?|"
+    r"набор(?:\s+клубник\w*)?|"
+    r"сладкий\s+стол|"
+    r"клубник\w*|"
+    r"капкейк\w*|"
+    r"трайфл\w*|"
+    r"рулет\w*"
+    r")\b",
+    re.IGNORECASE,
+)
+_CONVERSATIONAL_PRODUCT_RE = re.compile(
+    r"(?:"
+    r"уже\s+(?:скинул\w*|отправил\w*|писал\w*|договор\w*)|"
+    r"мы\s+же\s+обо\s+вс|"
+    r"как\s+я\s+(?:писал\w*|говорил\w*)|"
+    r"не\s+понимаю|"
+    r"референс\s+(?:я|уже)"
+    r")",
+    re.IGNORECASE,
+)
 
 _MONTH_DATE_RE = re.compile(
     r"\b(\d{1,2})\s+"
@@ -40,6 +63,35 @@ class ParsedBrief:
     delivery_date: str = ""
     delivery_time: str = ""
     address: str = ""
+
+
+def format_order_description(
+    product: str,
+    brief: str,
+    *,
+    max_len: int = 500,
+) -> str:
+    """Описание заказа для колонки «Тип торта» в Google Таблице."""
+    product_text = (product or "").strip()
+    brief_text = (brief or "").strip()
+
+    if not brief_text:
+        return product_text[:max_len]
+
+    product_usable = bool(
+        product_text
+        and _PRODUCT_KEYWORDS_RE.search(product_text)
+        and not _CONVERSATIONAL_PRODUCT_RE.search(product_text)
+    )
+    if not product_usable:
+        return brief_text[:max_len]
+
+    product_lower = product_text.lower()
+    brief_lower = brief_text.lower()
+    if brief_lower.startswith(product_lower) or product_lower in brief_lower[:80]:
+        return brief_text[:max_len]
+
+    return f"{product_text}. {brief_text}"[:max_len]
 
 
 def parse_brief(text: str) -> ParsedBrief:

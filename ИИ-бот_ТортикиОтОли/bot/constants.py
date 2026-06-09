@@ -11,11 +11,22 @@ SERVED_CITY_KEYS: dict[str, str] = {
     "нижний н": "Нижний Новгород",
 }
 
+SERVED_CITIES_TEXT = "Балахна, Заволжье и Нижний Новгород"
+DELIVERY_CITIES_TEXT = SERVED_CITIES_TEXT
+PICKUP_CITY = "Балахна"
+
 OUT_OF_AREA_HINT = (
-    "К сожалению, доставка и заказы в твоём городе пока не осуществляются 🎂\n"
-    "Мы работаем в Балахне, Заволжье и Нижнем Новгороде. "
-    "Если появится возможность — будем рады помочь!"
+    "К сожалению, доставка в твой город пока не осуществляется 🎂\n"
+    f"Доставка — в {DELIVERY_CITIES_TEXT}.\n"
+    f"Самовывоз возможен только в {PICKUP_CITY}."
 )
+
+RECEIPT_PICKUP = "pickup"
+RECEIPT_DELIVERY = "delivery"
+RECEIPT_PICKUP_LABEL = "Самовывоз"
+RECEIPT_DELIVERY_LABEL = "Доставка"
+RECEIPT_PICKUP_BUTTON = "🏠 Самовывоз"
+RECEIPT_DELIVERY_BUTTON = "🚗 Доставка"
 
 CLIENT_AFTER_LEAD_MESSAGE = (
     "Оля свяжется с тобой в течение 1 рабочего дня, чтобы уточнить детали заказа ✨"

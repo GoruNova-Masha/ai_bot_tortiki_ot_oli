@@ -31,7 +31,12 @@ def main() -> int:
     from google.oauth2.service_account import Credentials
     import gspread
 
-    from bot.google_sheets import SCOPES, SHEET_HEADERS, GoogleSheetsLeadWriter
+    from bot.google_sheets import (
+        SCOPES,
+        SHEET_HEADERS,
+        SHEET_HEADER_RANGE,
+        GoogleSheetsLeadWriter,
+    )
     from bot.lead import Lead
 
     creds_data = json.loads(settings.google_sheets_credentials_file.read_text(encoding="utf-8"))
@@ -72,7 +77,7 @@ def main() -> int:
 
     header = worksheet.row_values(1)
     if not any(cell.strip() for cell in header):
-        worksheet.update(values=[list(SHEET_HEADERS)], range_name="A1:K1")
+        worksheet.update(values=[list(SHEET_HEADERS)], range_name=SHEET_HEADER_RANGE)
         print("[OK] Шапка столбцов создана")
     elif [c.strip() for c in header if c.strip()] == list(SHEET_HEADERS):
         print("[OK] Шапка столбцов совпадает с шаблоном")

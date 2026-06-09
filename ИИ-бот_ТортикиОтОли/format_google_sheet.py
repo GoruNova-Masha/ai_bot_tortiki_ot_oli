@@ -9,7 +9,7 @@ from pathlib import Path
 from google.oauth2.service_account import Credentials
 import gspread
 
-from bot.google_sheets import SCOPES, SHEET_HEADERS, STATUS_IN_PROGRESS
+from bot.google_sheets import SCOPES, SHEET_HEADERS, SHEET_HEADER_RANGE, STATUS_IN_PROGRESS
 from config.settings import get_settings
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
@@ -25,8 +25,8 @@ COLOR_STATUS_BG = {"red": 0.996, "green": 0.949, "blue": 0.78}  # мягкий �
 
 STATUS_OPTIONS = ["Новая", STATUS_IN_PROGRESS, "Готово", "Отменена", "Завершена"]
 COL_COUNT = len(SHEET_HEADERS)
-PHONE_COL_INDEX = 9
-STATUS_COL_INDEX = 10
+PHONE_COL_INDEX = 10
+STATUS_COL_INDEX = 11
 
 
 def _sheet_cell(value: str) -> str:
@@ -261,7 +261,7 @@ def main() -> int:
     print(f"Строк до очистки: {len(rows)}")
 
     # Шапка
-    worksheet.update(values=[list(SHEET_HEADERS)], range_name="A1:K1")
+    worksheet.update(values=[list(SHEET_HEADERS)], range_name=SHEET_HEADER_RANGE)
 
     # Удаляем битые тестовые строки (старый тест с некорректными данными)
     if len(rows) > 1:
