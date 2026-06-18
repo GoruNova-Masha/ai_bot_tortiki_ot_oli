@@ -19,7 +19,7 @@ from bot.constants import (
     RECEIPT_PICKUP_LABEL,
 )
 from bot.lead import Lead
-from bot.lead_parser import ParsedBrief, format_order_description, parse_brief
+from bot.lead_parser import ParsedBrief, extract_cake_type, parse_lead_text
 from bot.sheets_buffer import SheetsBufferStore
 from config.settings import Settings
 
@@ -80,7 +80,7 @@ class GoogleSheetsLeadWriter:
         return self._settings.google_sheets_enabled
 
     def build_row(self, lead: Lead, lead_id: int, parsed: ParsedBrief | None = None) -> list[str]:
-        parsed = parsed or parse_brief(lead.brief)
+        parsed = parsed or parse_lead_text(lead.product, lead.brief)
         receipt_label = (
             RECEIPT_DELIVERY_LABEL
             if lead.receipt_method == RECEIPT_DELIVERY
@@ -89,14 +89,16 @@ class GoogleSheetsLeadWriter:
         if lead.receipt_method == RECEIPT_DELIVERY:
             if lead.delivery_address:
                 address = f"{lead.city}, {lead.delivery_address}"
+            elif parsed.address:
+                address = parsed.address
             else:
-                address = parsed.address or lead.city
+                address = lead.city
         else:
             address = f"Самовывоз ({PICKUP_CITY})"
         return [
             str(lead_id),
             lead.contact_date,
-            format_order_description(lead.product, lead.brief),
+            extract_cake_type(lead.product, lead.brief),
             parsed.weight_kg,
             parsed.flavors,
             receipt_label,
@@ -110,7 +112,7 @@ class GoogleSheetsLeadWriter:
 
     async def submit_lead(self, lead: Lead) -> LeadSubmitResult:
         lead_id = self._next_lead_id()
-        parsed = parse_brief(lead.brief)
+        parsed = parse_lead_text(lead.product, lead.brief)
         row = self.build_row(lead, lead_id, parsed)
 
         if not self.enabled:
