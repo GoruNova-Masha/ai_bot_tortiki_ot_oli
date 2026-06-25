@@ -12,8 +12,14 @@ from typing import Any
 import gspread
 from google.oauth2.service_account import Credentials
 
+from bot.constants import (
+    PICKUP_CITY,
+    RECEIPT_DELIVERY,
+    RECEIPT_DELIVERY_LABEL,
+    RECEIPT_PICKUP_LABEL,
+)
 from bot.lead import Lead
-from bot.lead_parser import ParsedBrief, parse_brief
+from bot.lead_parser import ParsedBrief, extract_cake_type, parse_lead_text
 from bot.sheets_buffer import SheetsBufferStore
 from config.settings import Settings
 
@@ -30,13 +36,16 @@ SHEET_HEADERS = (
     "Тип торта",
     "Вес (кг)",
     "Вкусы начинки",
-    "Дата доставки",
-    "Время доставки",
-    "Адрес доставки",
+    "Способ получения",
+    "Дата получения",
+    "Время получения",
+    "Адрес",
     "Имя клиента",
     "Телефон клиента",
     "Статус",
 )
+
+SHEET_HEADER_RANGE = f"A1:{chr(ord('A') + len(SHEET_HEADERS) - 1)}1"
 
 STATUS_IN_PROGRESS = "В работе"
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -55,6 +64,7 @@ def _sheet_cell(value: str) -> str:
 class LeadSubmitResult:
     lead_id: int
     delivery_date: str
+    receipt_method: str
     saved_to_sheets: bool
     buffered: bool
 
@@ -70,14 +80,28 @@ class GoogleSheetsLeadWriter:
         return self._settings.google_sheets_enabled
 
     def build_row(self, lead: Lead, lead_id: int, parsed: ParsedBrief | None = None) -> list[str]:
-        parsed = parsed or parse_brief(lead.brief)
-        address = parsed.address or lead.city
+        parsed = parsed or parse_lead_text(lead.product, lead.brief)
+        receipt_label = (
+            RECEIPT_DELIVERY_LABEL
+            if lead.receipt_method == RECEIPT_DELIVERY
+            else RECEIPT_PICKUP_LABEL
+        )
+        if lead.receipt_method == RECEIPT_DELIVERY:
+            if lead.delivery_address:
+                address = f"{lead.city}, {lead.delivery_address}"
+            elif parsed.address:
+                address = parsed.address
+            else:
+                address = lead.city
+        else:
+            address = f"Самовывоз ({PICKUP_CITY})"
         return [
             str(lead_id),
             lead.contact_date,
-            lead.product,
+            extract_cake_type(lead.product, lead.brief),
             parsed.weight_kg,
             parsed.flavors,
+            receipt_label,
             parsed.delivery_date,
             parsed.delivery_time,
             address,
@@ -88,7 +112,7 @@ class GoogleSheetsLeadWriter:
 
     async def submit_lead(self, lead: Lead) -> LeadSubmitResult:
         lead_id = self._next_lead_id()
-        parsed = parse_brief(lead.brief)
+        parsed = parse_lead_text(lead.product, lead.brief)
         row = self.build_row(lead, lead_id, parsed)
 
         if not self.enabled:
@@ -99,6 +123,7 @@ class GoogleSheetsLeadWriter:
             return LeadSubmitResult(
                 lead_id=lead_id,
                 delivery_date=parsed.delivery_date,
+                receipt_method=lead.receipt_method,
                 saved_to_sheets=False,
                 buffered=False,
             )
@@ -109,6 +134,7 @@ class GoogleSheetsLeadWriter:
             return LeadSubmitResult(
                 lead_id=lead_id,
                 delivery_date=parsed.delivery_date,
+                receipt_method=lead.receipt_method,
                 saved_to_sheets=True,
                 buffered=False,
             )
@@ -121,6 +147,7 @@ class GoogleSheetsLeadWriter:
         return LeadSubmitResult(
             lead_id=lead_id,
             delivery_date=parsed.delivery_date,
+            receipt_method=lead.receipt_method,
             saved_to_sheets=False,
             buffered=True,
         )
@@ -217,11 +244,11 @@ class GoogleSheetsLeadWriter:
             return
 
         if not any(cell.strip() for cell in first_row):
-            worksheet.update(values=[list(SHEET_HEADERS)], range_name="A1:K1")
+            worksheet.update(values=[list(SHEET_HEADERS)], range_name=SHEET_HEADER_RANGE)
             logger.info("Создана шапка Google Таблицы")
             return
 
-        worksheet.update(values=[list(SHEET_HEADERS)], range_name="A1:K1")
+        worksheet.update(values=[list(SHEET_HEADERS)], range_name=SHEET_HEADER_RANGE)
         logger.info("Шапка Google Таблицы приведена к шаблону бота")
         return
 

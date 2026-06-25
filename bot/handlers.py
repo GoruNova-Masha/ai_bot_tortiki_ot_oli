@@ -18,8 +18,22 @@ from telegram.ext import (
 )
 
 from bot.ai_client import AIAssistant
-from bot.constants import MENU_CATEGORIES
-from bot.geography import out_of_area_message, resolve_city
+from bot.constants import (
+    BENTO_CATEGORY_HINT,
+    DELIVERY_CITIES_TEXT,
+    MENU_CATEGORIES,
+    PICKUP_CITY,
+    RECEIPT_DELIVERY,
+    RECEIPT_PICKUP,
+    RECEIPT_PICKUP_LABEL,
+)
+from bot.geography import (
+    out_of_area_message,
+    pickup_available,
+    receipt_options,
+    receipt_options_hint,
+    resolve_city,
+)
 from bot.google_sheets import GoogleSheetsLeadWriter
 from bot.keyboards import (
     CONSENT_AGREE,
@@ -28,6 +42,7 @@ from bot.keyboards import (
     cancel_lead_keyboard,
     main_menu_keyboard,
     pd_consent_inline_keyboard,
+    receipt_method_keyboard,
 )
 from bot.media import (
     PHOTO_BRIEF_PROMPT,
@@ -44,6 +59,7 @@ from bot.lead import (
     normalize_phone,
     pd_consent_message,
 )
+from bot.lead_draft import LeadDraft, format_draft_summary, wants_draft_reuse
 from bot.privacy_policy import POLICY_BUTTON_LABEL, format_privacy_policy_html
 from bot.network import retry_on_network
 from bot.prompts import build_system_prompt
@@ -57,7 +73,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Состояния оформления заявки
-LEAD_CONSENT, LEAD_NAME, LEAD_PHONE, LEAD_CITY, LEAD_PRODUCT, LEAD_BRIEF = range(6)
+(
+    LEAD_CONSENT,
+    LEAD_NAME,
+    LEAD_PHONE,
+    LEAD_CITY,
+    LEAD_RECEIPT,
+    LEAD_ADDRESS,
+    LEAD_PRODUCT,
+    LEAD_BRIEF,
+) = range(8)
 
 CATEGORY_HINTS: dict[str, str] = {
     "cakes": (
@@ -66,12 +91,7 @@ CATEGORY_HINTS: dict[str, str] = {
         "Есть авторская линейка: Вишневый, Красный бархат, Сникерс и другие.\n"
         "Расскажи, на какой повод и примерный вес — подскажу варианты!"
     ),
-    "bento": (
-        "🍰 <b>Бенто-торты</b>\n"
-        "S — 650 г, 1600 ₽ | M — 1 кг, 2600 ₽.\n"
-        "По умолчанию начинка «Вишневый». Декор проще, чем у большого торта.\n"
-        "Для кого торт и какая надпись нужна?"
-    ),
+    "bento": BENTO_CATEGORY_HINT,
     "sets": (
         "🎁 <b>Букеты из клубники в шоколаде</b>\n"
         "Стандартные наборы от 4 до 16 ягод, премиум — 4000 ₽.\n"
@@ -198,6 +218,36 @@ def _is_consent_decline(text: str) -> bool:
     return normalized in ("не согласен", "не согласна", "нет", "no")
 
 
+def _get_lead_draft(context: ContextTypes.DEFAULT_TYPE) -> LeadDraft | None:
+    return LeadDraft.from_dict(context.user_data.get("lead_draft"))
+
+
+async def _load_draft_from_chat(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    history = get_ctx().memory.get(message.chat_id)
+    if not history:
+        return
+    try:
+        await message.chat.send_action("typing")
+    except (TimedOut, NetworkError, TelegramError):
+        pass
+    try:
+        draft = await get_ctx().ai.extract_lead_draft(history)
+    except Exception:
+        logger.exception("Не удалось извлечь черновик заявки из переписки")
+        return
+    if not draft or not draft.has_any():
+        return
+    context.user_data["lead_draft"] = draft.to_dict()
+    summary = format_draft_summary(draft)
+    if summary:
+        await message.reply_text(
+            "Из нашей переписки уже есть детали заказа:\n"
+            f"{summary}\n\n"
+            "Подтяну их в заявку — останется указать контакты "
+            "и при необходимости дополнить данные."
+        )
+
+
 async def _grant_consent(message, context: ContextTypes.DEFAULT_TYPE) -> int:
     settings = get_ctx().settings
     consent_at = consent_datetime_label(settings)
@@ -210,8 +260,10 @@ async def _grant_consent(message, context: ContextTypes.DEFAULT_TYPE) -> int:
     except OSError:
         logger.exception("Не удалось сохранить согласие на ПД")
 
+    await _load_draft_from_chat(message, context)
+
     await message.reply_text(
-        "Спасибо! Как тебя зовут?",
+        "Спасибо! Как вас зовут?",
         reply_markup=cancel_lead_keyboard(),
     )
     return LEAD_NAME
@@ -293,10 +345,121 @@ async def lead_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return LEAD_PHONE
     context.user_data["lead_phone"] = format_phone_display(phone)
+    draft = _get_lead_draft(context)
+    if draft and draft.city:
+        await update.message.reply_text(
+            f"Город из переписки: {draft.city}.",
+            reply_markup=cancel_lead_keyboard(),
+        )
+        return await _apply_lead_city(update.message, context, draft.city)
+
     await update.message.reply_text(
-        "Из какого ты города? (Балахна, Заволжье или Нижний Новгород)"
+        "Из какого вы города? (Балахна, Заволжье или Нижний Новгород)"
     )
     return LEAD_CITY
+
+
+async def _start_delivery_address(message, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["lead_receipt"] = RECEIPT_DELIVERY
+    await message.reply_text(
+        "Укажи адрес доставки: улица, дом, подъезд, этаж.",
+        reply_markup=cancel_lead_keyboard(),
+    )
+    return LEAD_ADDRESS
+
+
+async def _start_pickup_order(message, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["lead_receipt"] = RECEIPT_PICKUP
+    context.user_data["lead_delivery_address"] = ""
+    if not pickup_available(context.user_data.get("lead_city", "")):
+        await message.reply_text(f"Самовывоз — в {PICKUP_CITY}.")
+    return await _continue_after_product_setup(message, context)
+
+
+async def _continue_after_address(message, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _continue_after_product_setup(message, context)
+
+
+async def _continue_after_product_setup(message, context: ContextTypes.DEFAULT_TYPE) -> int:
+    draft = _get_lead_draft(context)
+    if draft and draft.product and not context.user_data.get("lead_product"):
+        context.user_data["lead_product"] = draft.product[:300]
+        return await _proceed_to_brief(message, context)
+    return await _ask_lead_product(message, context)
+
+
+async def _proceed_to_brief(message, context: ContextTypes.DEFAULT_TYPE) -> int:
+    draft = _get_lead_draft(context)
+    brief_text = (draft.brief[:1500] if draft and draft.brief else "")
+    if brief_text:
+        context.user_data["lead_brief_candidate"] = brief_text
+        await message.reply_text(
+            "Пожелания из переписки:\n\n"
+            f"{brief_text}\n\n"
+            "Если всё верно — напишите «да». Или дополните и исправьте одним сообщением.",
+            reply_markup=cancel_lead_keyboard(),
+        )
+        return LEAD_BRIEF
+
+    if context.user_data.get("lead_receipt") == RECEIPT_DELIVERY:
+        brief_prompt = (
+            "Дополните, если нужно, пожелания к заказу: дата доставки, время, "
+            "вес, вкусы, декор, надпись, аллергии."
+        )
+    else:
+        brief_prompt = (
+            "Дополните, если нужно, пожелания к заказу: дата самовывоза, "
+            "вес, вкусы, декор, надпись, аллергии."
+        )
+    await message.reply_text(brief_prompt, reply_markup=cancel_lead_keyboard())
+    return LEAD_BRIEF
+
+
+async def _continue_after_city(message, context: ContextTypes.DEFAULT_TYPE) -> int:
+    can_pickup = context.user_data.get("lead_pickup_ok", False)
+    can_deliver = context.user_data.get("lead_delivery_ok", False)
+    draft = _get_lead_draft(context)
+
+    if draft and draft.receipt_method:
+        if draft.receipt_method == RECEIPT_PICKUP and can_pickup:
+            return await _start_pickup_order(message, context)
+        if draft.receipt_method == RECEIPT_DELIVERY and can_deliver:
+            context.user_data["lead_receipt"] = RECEIPT_DELIVERY
+            if draft.delivery_address:
+                context.user_data["lead_delivery_address"] = draft.delivery_address[:300]
+                return await _continue_after_address(message, context)
+            return await _start_delivery_address(message, context)
+
+    if can_pickup and can_deliver:
+        await message.reply_text(
+            "Как удобнее получить заказ?",
+            reply_markup=receipt_method_keyboard(pickup=True, delivery=True),
+        )
+        return LEAD_RECEIPT
+
+    if can_deliver:
+        return await _start_delivery_address(message, context)
+
+    return await _start_pickup_order(message, context)
+
+
+async def _apply_lead_city(
+    message, context: ContextTypes.DEFAULT_TYPE, city_text: str
+) -> int:
+    in_area, city = resolve_city(city_text)
+    context.user_data["lead_city"] = city
+    context.user_data["lead_city_ok"] = in_area
+
+    can_pickup, can_deliver = receipt_options(city, in_area)
+    context.user_data["lead_pickup_ok"] = can_pickup
+    context.user_data["lead_delivery_ok"] = can_deliver
+
+    if not in_area:
+        await message.reply_text(out_of_area_message(city))
+    else:
+        await message.reply_text(receipt_options_hint(city, in_area))
+
+    return await _continue_after_city(message, context)
 
 
 async def lead_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -304,38 +467,137 @@ async def lead_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if text == "❌ Отменить заявку":
         return await _cancel_lead(update, context)
 
-    in_area, city = resolve_city(text)
-    context.user_data["lead_city"] = city
-    context.user_data["lead_city_ok"] = in_area
+    return await _apply_lead_city(update.message, context, text)
 
-    if not in_area:
-        await update.message.reply_text(out_of_area_message(city))
+
+def _is_receipt_pickup(text: str) -> bool:
+    normalized = text.strip().lower().replace("🏠", "").strip()
+    return normalized == RECEIPT_PICKUP_LABEL.lower()
+
+
+def _is_receipt_delivery(text: str) -> bool:
+    normalized = text.strip().lower().replace("🚗", "").strip()
+    return normalized == RECEIPT_DELIVERY_LABEL.lower()
+
+
+async def _ask_lead_product(message, context: ContextTypes.DEFAULT_TYPE) -> int:
+    draft = _get_lead_draft(context)
+    if draft and draft.has_order_details():
+        await message.reply_text(
+            "Тип заказа и пожелания уже есть в переписке.\n"
+            "Напишите «да», чтобы продолжить, или укажите тип заказа, если нужно исправить.",
+            reply_markup=cancel_lead_keyboard(),
+        )
+    else:
+        await message.reply_text(
+            "Какой тип заказа?\n"
+            "Например: торт на день рождения, бенто-торт, набор клубники, сладкий стол.",
+            reply_markup=cancel_lead_keyboard(),
+        )
+    return LEAD_PRODUCT
+
+
+async def lead_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip()
+    if text == "❌ Отменить заявку":
+        return await _cancel_lead(update, context)
+
+    can_pickup = context.user_data.get("lead_pickup_ok", False)
+    can_deliver = context.user_data.get("lead_delivery_ok", False)
+    keyboard = receipt_method_keyboard(pickup=can_pickup, delivery=can_deliver)
+
+    if _is_receipt_pickup(text):
+        if not can_pickup:
+            await update.message.reply_text(
+                f"Самовывоз возможен только в {PICKUP_CITY}.",
+                reply_markup=keyboard,
+            )
+            return LEAD_RECEIPT
+        return await _start_pickup_order(update.message, context)
+
+    if _is_receipt_delivery(text):
+        if not can_deliver:
+            await update.message.reply_text(
+                f"Доставка возможна только в {DELIVERY_CITIES_TEXT}. "
+                f"Выбери самовывоз в {PICKUP_CITY} или укажи другой город.",
+                reply_markup=keyboard,
+            )
+            return LEAD_RECEIPT
+        return await _start_delivery_address(update.message, context)
 
     await update.message.reply_text(
-        "Что тебя интересует?\n"
-        "Например: торт на день рождения, бенто, набор клубники, сладкий стол."
+        "Выбери способ получения кнопкой ниже.",
+        reply_markup=keyboard,
     )
-    return LEAD_PRODUCT
+    return LEAD_RECEIPT
+
+
+async def lead_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip()
+    if text == "❌ Отменить заявку":
+        return await _cancel_lead(update, context)
+    if len(text) < 5:
+        await update.message.reply_text(
+            "Адрес слишком короткий. Укажи улицу, дом и при необходимости подъезд и этаж."
+        )
+        return LEAD_ADDRESS
+    context.user_data["lead_delivery_address"] = text[:300]
+    return await _continue_after_address(update.message, context)
 
 
 async def lead_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = (update.message.text or "").strip()
     if text == "❌ Отменить заявку":
         return await _cancel_lead(update, context)
-    if len(text) < 3:
-        await update.message.reply_text("Опиши коротко, что хочешь заказать.")
+
+    draft = _get_lead_draft(context)
+    if wants_draft_reuse(text):
+        if draft and draft.product:
+            context.user_data["lead_product"] = draft.product[:300]
+            return await _proceed_to_brief(update.message, context)
+        if draft and draft.brief:
+            context.user_data["lead_product"] = (
+                draft.product or "Заказ по переписке"
+            )[:300]
+            return await _proceed_to_brief(update.message, context)
+        await update.message.reply_text(
+            "Не нашла детали в переписке. Коротко укажите тип заказа, "
+            "например: бенто-торт."
+        )
         return LEAD_PRODUCT
+
+    if len(text) < 3:
+        await update.message.reply_text("Опишите коротко, что хотите заказать.")
+        return LEAD_PRODUCT
+
     context.user_data["lead_product"] = text[:300]
-    await update.message.reply_text(
-        "Кратко опиши пожелания: дата праздника, вес/количество, вкусы, декор, аллергии."
-    )
-    return LEAD_BRIEF
+    return await _proceed_to_brief(update.message, context)
 
 
 async def lead_brief(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = (update.message.text or "").strip()
     if text == "❌ Отменить заявку":
         return await _cancel_lead(update, context)
+
+    draft = _get_lead_draft(context)
+    candidate = str(context.user_data.get("lead_brief_candidate", "")).strip()
+
+    if wants_draft_reuse(text):
+        if candidate:
+            context.user_data.pop("lead_brief_candidate", None)
+            return await _finish_lead_brief(update, context, candidate)
+        if draft and draft.brief:
+            return await _finish_lead_brief(update, context, draft.brief[:1500])
+        await update.message.reply_text(
+            "Не нашла пожелания в переписке. Опишите заказ одним сообщением."
+        )
+        return LEAD_BRIEF
+
+    context.user_data.pop("lead_brief_candidate", None)
+    if candidate and text:
+        merged = f"{candidate}\n\nДополнение клиента: {text}"[:1500]
+        return await _finish_lead_brief(update, context, merged)
+
     return await _finish_lead_brief(update, context, text)
 
 
@@ -400,10 +662,16 @@ async def _finish_lead_brief(
             ("lead_name", "имя"),
             ("lead_phone", "телефон"),
             ("lead_city", "город"),
+            ("lead_receipt", "способ получения"),
             ("lead_product", "заказ"),
         )
         if not context.user_data.get(key)
     ]
+    if (
+        context.user_data.get("lead_receipt") == RECEIPT_DELIVERY
+        and not context.user_data.get("lead_delivery_address")
+    ):
+        missing.append("адрес доставки")
     if missing:
         logger.warning(
             "Неполная заявка user_id=%s, нет полей: %s",
@@ -428,6 +696,8 @@ async def _finish_lead_brief(
         user_id=user.id,
         contact_date=contact_date_label(settings),
         pd_consent_at=context.user_data.get("pd_consent_at", "—"),
+        receipt_method=context.user_data.get("lead_receipt", RECEIPT_PICKUP),
+        delivery_address=context.user_data.get("lead_delivery_address", ""),
     )
 
     try:
@@ -487,6 +757,7 @@ async def _submit_lead(update: Update, settings: Settings, lead: Lead) -> None:
         submit_result = LeadSubmitResult(
             lead_id=0,
             delivery_date="",
+            receipt_method=lead.receipt_method,
             saved_to_sheets=False,
             buffered=False,
         )
@@ -498,6 +769,7 @@ async def _submit_lead(update: Update, settings: Settings, lead: Lead) -> None:
                     settings,
                     lead_id=submit_result.lead_id,
                     delivery_date=submit_result.delivery_date,
+                    receipt_method=submit_result.receipt_method,
                 ),
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_menu_keyboard(),
@@ -533,7 +805,13 @@ def _clear_lead(context: ContextTypes.DEFAULT_TYPE) -> None:
         "lead_phone",
         "lead_city",
         "lead_city_ok",
+        "lead_pickup_ok",
+        "lead_delivery_ok",
+        "lead_receipt",
+        "lead_delivery_address",
         "lead_product",
+        "lead_draft",
+        "lead_brief_candidate",
         "pd_consent_at",
     ):
         context.user_data.pop(key, None)
@@ -721,6 +999,8 @@ def register_handlers(app: Application, settings: Settings) -> None:
             LEAD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, lead_name)],
             LEAD_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, lead_phone)],
             LEAD_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, lead_city)],
+            LEAD_RECEIPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, lead_receipt)],
+            LEAD_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, lead_address)],
             LEAD_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, lead_product)],
             LEAD_BRIEF: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, lead_brief),

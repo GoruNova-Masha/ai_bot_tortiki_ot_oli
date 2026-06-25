@@ -10,7 +10,7 @@ from typing import Any
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _BUSY_DATES_PATH = _PROJECT_ROOT / "data" / "busy_dates.json"
 _PD_CONSENTS_PATH = _PROJECT_ROOT / "data" / "pd_consents.json"
-_MAX_HISTORY = 12
+_MAX_HISTORY = 24
 
 
 def _ensure_data_dir() -> None:

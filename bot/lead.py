@@ -4,7 +4,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from bot.constants import CLIENT_AFTER_LEAD_MESSAGE, PHONE_DISPLAY
+from bot.constants import (
+    CLIENT_AFTER_LEAD_MESSAGE,
+    PHONE_DISPLAY,
+    PICKUP_CITY,
+    RECEIPT_DELIVERY,
+    RECEIPT_DELIVERY_LABEL,
+    RECEIPT_PICKUP_LABEL,
+)
 from config.settings import Settings
 
 
@@ -19,16 +26,33 @@ class Lead:
     user_id: int
     contact_date: str
     pd_consent_at: str
+    receipt_method: str = RECEIPT_DELIVERY
+    delivery_address: str = ""
+
+    @property
+    def receipt_label(self) -> str:
+        if self.receipt_method == RECEIPT_DELIVERY:
+            return RECEIPT_DELIVERY_LABEL
+        return RECEIPT_PICKUP_LABEL
 
     def format_for_manager(self, lead_id: int | None = None) -> str:
         area = "✅ в зоне доставки" if self.city_in_service_area else "⚠️ вне зоны (информирован)"
         id_line = f"<b>№ заявки:</b> {lead_id}\n" if lead_id else ""
+        receipt_line = f"<b>Способ получения:</b> {self._esc(self.receipt_label)}\n"
+        if self.receipt_method == RECEIPT_DELIVERY and self.delivery_address:
+            receipt_line += (
+                f"<b>Адрес доставки:</b> "
+                f"{self._esc(f'{self.city}, {self.delivery_address}')}\n"
+            )
+        elif self.receipt_method != RECEIPT_DELIVERY:
+            receipt_line += f"<b>Самовывоз:</b> {self._esc(PICKUP_CITY)}\n"
         return (
             "🆕 <b>Заявка из бота «Тортики от Оли»</b>\n\n"
             f"{id_line}"
             f"<b>Имя:</b> {self._esc(self.name)}\n"
             f"<b>Телефон:</b> {self._esc(self.phone)}\n"
             f"<b>Город:</b> {self._esc(self.city)} ({area})\n"
+            f"{receipt_line}"
             f"<b>Дата обращения:</b> {self.contact_date}\n"
             f"<b>Согласие на ПД:</b> {self._esc(self.pd_consent_at)}\n"
             f"<b>Интерес:</b> {self._esc(self.product)}\n"
@@ -100,13 +124,19 @@ def client_handoff_text(
     *,
     lead_id: int,
     delivery_date: str = "",
+    receipt_method: str = RECEIPT_DELIVERY,
 ) -> str:
     phone = PHONE_DISPLAY
     if delivery_date.strip():
-        ready_line = f"Ваш заказ будет готов к <b>{delivery_date.strip()}</b>."
+        date_label = (
+            "Дата доставки"
+            if receipt_method == RECEIPT_DELIVERY
+            else "Дата самовывоза"
+        )
+        ready_line = f"{date_label}: <b>{delivery_date.strip()}</b>."
     else:
         ready_line = (
-            "Точную дату готовности Оля уточнит при звонке — "
+            "Точную дату Оля уточнит при звонке — "
             "обычно это в течение 1 рабочего дня ✨"
         )
     return (

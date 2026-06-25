@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 
-from bot.constants import MENU_CATEGORIES
+from bot.constants import MENU_CATEGORIES, RECEIPT_DELIVERY_BUTTON, RECEIPT_PICKUP_BUTTON
 
 CONSENT_AGREE = "pd_consent:agree"
 CONSENT_DECLINE = "pd_consent:decline"
@@ -20,6 +20,17 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
 
 def cancel_lead_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup([["❌ Отменить заявку"]], resize_keyboard=True)
+
+
+def receipt_method_keyboard(*, pickup: bool = True, delivery: bool = True) -> ReplyKeyboardMarkup:
+    row: list[str] = []
+    if pickup:
+        row.append(RECEIPT_PICKUP_BUTTON)
+    if delivery:
+        row.append(RECEIPT_DELIVERY_BUTTON)
+    if not row:
+        row = [RECEIPT_PICKUP_BUTTON]
+    return ReplyKeyboardMarkup([row, ["❌ Отменить заявку"]], resize_keyboard=True)
 
 
 def pd_consent_inline_keyboard() -> InlineKeyboardMarkup:

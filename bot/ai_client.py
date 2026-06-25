@@ -5,6 +5,7 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
+from bot.lead_draft import EXTRACT_SYSTEM_PROMPT, LeadDraft, parse_lead_draft_json
 from config.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,20 @@ class AIAssistant:
         )
         return result or CHAT_UNAVAILABLE_MESSAGE
 
+    async def extract_lead_draft(self, history: list[dict[str, str]]) -> LeadDraft | None:
+        if not history:
+            return None
+        transcript = "\n".join(
+            f"{'Клиент' if item['role'] == 'user' else 'Бот'}: {item['content']}"
+            for item in history
+        )
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
+            {"role": "user", "content": transcript},
+        ]
+        raw = await self._complete_raw(messages, temperature=0.1, max_tokens=500)
+        return parse_lead_draft_json(raw or "")
+
     async def describe_image_for_brief(self, prompt: str, image_data_url: str) -> str | None:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": BRIEF_IMAGE_SYSTEM_PROMPT},
@@ -84,12 +99,13 @@ class AIAssistant:
         *,
         model: str | None = None,
         max_tokens: int = 900,
+        temperature: float = 0.7,
     ) -> str | None:
         try:
             response = await self._client.chat.completions.create(
                 model=model or self._settings.openai_model,
                 messages=messages,
-                temperature=0.7,
+                temperature=temperature,
                 max_tokens=max_tokens,
             )
             text = response.choices[0].message.content
